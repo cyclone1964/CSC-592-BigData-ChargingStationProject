@@ -68,7 +68,12 @@ heavyHittersTime = endTime - startTime
 startTime = Sys.time()
 hitCount = list()
 for (name in chargeData$Station.Name) {
-  hitCount[name] = length(which(chargeData$Station.Name == name))
+  index=which(names(hitCount)==name)
+  if (length(index) ==1) {
+    hitCount[name] = as.numeric(hitCount[name]) + 1
+  } else {
+    hitCount[name] = 0
+  }
 }
 endTime = Sys.time()
 exhaustiveTime = endTime - startTime

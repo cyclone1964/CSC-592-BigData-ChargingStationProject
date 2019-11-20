@@ -161,7 +161,8 @@ if (!exists("chargeData")) {
     chargeData = read.csv("RI-ChargingData-2019-10-10.csv", stringsAsFactors=FALSE)
     
     ## Now, get rid of the entries with missing fields of interest
-    goodIndices = which(chargeData$User.ID != "" & 
+    goodIndices = which(chargeData$User.ID != "" &
+                        chargeData$User.ID != "0" & 
                         chargeData$End.Date != "" & 
                         chargeData$Start.Date != "" &
                         chargeData$Total.Duration..hh.mm.ss. != "")

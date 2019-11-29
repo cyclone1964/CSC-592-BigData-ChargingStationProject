@@ -154,6 +154,8 @@ library('lubridate')
 library('gridExtra')
 library('grid')
 library('igraph')
+library('openssl')
+library('zipcode')
 
 if (!exists("chargeData")) {
 
@@ -342,8 +344,8 @@ if (!exists("sessionsPerDay")) {
             min(startTime[stationIndices])
         sessionsPerDay[stationName] = numSessions/as.numeric(totalDays);
     }
-    sessionsPerDay = sessionsPerDay[order(unlist(sessionsPerDay),
-                                          decreasing=TRUE)]
+    stationBusinessOrder = order(unlist(sessionsPerDay),decreasing=TRUE)
+    sessionsPerDay = sessionsPerDay[stationBusinessOrder]
     plot.new()
     plot(sessionsPerDay,
          type='o',
@@ -401,8 +403,15 @@ if (!exists("numVertices")) {
     ## split.
     
     ## To address that second one, let's "uniquefy" the matrix: only one
-    ## copy of each user/station edge.
+    ## copy of each user/station edge. While we are at it, let's compute the
+    ## count of each unique edge
     uniqueEdgeList = unique(edgeList)
+    uniqueEdgeCount = matrix(0,nrow=nrow(uniqueEdgeList),ncol=1)
+    for (index in seq(1,nrow(uniqueEdgeList))) {
+        uniqueEdgeCount[index] =
+            length(which(edgeList[,1] == uniqueEdgeList[index,1] &
+                         edgeList[,2] == uniqueEdgeList[index,2]))
+    }
 
     vmaxList = c(10,25,50,100,250,500,1000,2500,5000,10000,20000,40000, 80000)
     tableData = matrix(0,nrow = length(vmaxList),ncol=2,byrow=TRUE)
@@ -428,41 +437,27 @@ if (!exists("numVertices")) {
     colnames(tableData) = c("vMax","# Communities")
     plot.new()
     grid.table(tableData)
-    
-    ## So that really didn't tell us much: the nature of that community 
-    ## algorithm is such that it does not really retain community structure. 
-    ##
-    ## Instead, let's execute the following analysis:
-    ## Let's use heavy hitters to find the most popular edges!!
-    numEdges = 1
-    
-    edgeUser = c()
-    edgeIndex = c()
-    edgeCount = c()
-    edgeEnergy = c()
-    edgeStation = c()
-    
-    for (index in seq(1,nrow(chargeData))) {
-        edge = toString(c(chargeData$User.ID[index],chargeData$Station.Name[index]))
-        if (length(edgeUser) == 0 ||
-            is.na(edgeUser[edge])) {
-            edgeUser[edge] = chargeData$User.ID[index]
-            edgeCount[edge] = 0
-            edgeIndex[edge] = numEdges
-            edgeEnergy[edge] = 0
-            edgeStation[edge] = chargeData$Station.Name[index]
-            numEdges = numEdges + 1
-        }
-        edgeEnergy[edge] = edgeEnergy[edge] + chargeData$Energy..kWh.[index]
-        edgeCount[edge] = edgeCount[edge] + 1
-    }
 }
-if (TRUE || !exists('monthlyClosenessCentrality')) {
+if (!exists('monthlyClosenessCentrality')) {
     ## first, let's make a graph from the entire edge list
     print("Let's try a plot of closness centrality for all of the ")
     print("stations as a function of month")
-    chargeGraph = graph(as.vector(t(edgeList)),n=numVertices,directed=FALSE)
-  
+    chargeGraph =
+        graph(as.vector(t(uniqueEdgeList)),n=numVertices,directed=FALSE)
+
+    ## Now, let's compute the centrality of all the stations across
+    ## the entire time (using the weights) and see what that looks
+    ## like.
+    allCloseness = closeness(chargeGraph,
+                             vids = stationBusinessOrder,
+                             mode="all",
+                             normalized=TRUE)
+    plot.new()
+    plot(allCloseness,
+         xlab='Station (Ordered by Busyness)',
+         ylab='Closeness Centrality',
+         main='Station Closeness Centrality (All Data)');
+         
     ## Now, get the year of the first and last time
     monthlyClosenessCentrality = c()
     periodDates = c()
@@ -470,17 +465,29 @@ if (TRUE || !exists('monthlyClosenessCentrality')) {
         for (thisMonth in seq(1,12)) {
             monthIndices = which(year(startTime) == thisYear &
                                  month(startTime) == thisMonth)
-            if (length(monthIndices) > 0) {
+            if (length(monthIndices) > 1) {
+                monthEdgeList = edgeList[monthIndices,];
+                uniqueMonthEdgeList = unique(monthEdgeList)
+                monthEdgeCount =
+                    matrix(0,nrow = nrow(uniqueMonthEdgeList),ncol=1)
+                for (index in seq(1,nrow(uniqueMonthEdgeList))) {
+                    monthEdgeCount[index] =
+                        length(which(monthEdgeList[,1] ==
+                                     uniqueMonthEdgeList[index,1] &
+                                     monthEdgeList[,2] ==
+                                     uniqueMonthEdgeList[index,2]))
+                }
                 periodDates = c(periodDates,startTime[monthIndices[1]])
-                temp = graph(as.vector(t(edgeList[monthIndices,])),
-                             n=numVertices,directed=FALSE)
-                closeness = estimate_closeness(temp,
-                                               vids = seq(1,numStations),
-                                               mode="all",
-                                               normalized = TRUE,
-                                               100)
-                monthlyClosenessCentrality = cbind(monthlyClosenessCentrality,
-                                                   closeness)
+                temp = graph(as.vector(t(uniqueMonthEdgeList)),
+                             n=length(unique(as.vector(uniqueMonthEdgeList))),
+                             directed=FALSE)
+                monthCloseness = closeness(temp,
+                                           vids = seq(1,numStations),
+                                           mode="all",
+                                           normalized = TRUE)
+
+                monthlyClosenessCentrality =
+                    cbind(monthlyClosenessCentrality,monthCloseness)
             }
         }
     }
@@ -490,3 +497,92 @@ if (TRUE || !exists('monthlyClosenessCentrality')) {
             main='Closeness Centrality of All Stations')
 }
 
+if (!exists('stationUserCount')) {
+
+    ## Let's go through and count the number of unique users for each station
+    stationUserCount = c()
+    for (stationName in stationNames) {
+        indices = which(chargeData$Station.Name == stationName)
+        stationUserCount[stationName] =
+            length(unique(chargeData$User.ID[indices]))
+    }
+
+    plot.new()
+    plot(stationUserCount[stationBusinessOrder],
+         xlab='Station (Sorted)',
+         ylab='# Unique Users',
+         main='Station Unique User Count')
+}
+
+## Now, that's interesting. So the next question is to check the
+## promiscuity of users with respect to stations
+
+if (TRUE) {
+    ## Let's go through and count the number of unique users for each station
+    userStationCount = c()
+    for (userId in unique(chargeData$User.ID)) {
+        indices = which(chargeData$User.ID == userId)
+        userStationCount[userId] =
+            length(unique(chargeData$Station.Name[indices]))
+    }
+
+    plot.new()
+    plot(userStationCount,
+         xlab='User (UnSorted)',
+         ylab='# Unique Users',
+         main='Station Unique User Count')
+    
+    plot.new()
+    data = hist(userStationCount,breaks = seq(0,30),plot=FALSE);
+    barplot(pmin(100,data$counts),
+            ylab='# of Users ',
+            xlab='# Stations',
+            names.arg = seq(1,30),
+            main='User Station Set Size')
+}
+## Now let's see if we can identify times when charging stations are
+## used in quick succession. We can use this as an indication that a
+## specific station is could stand to be upgraded to more slots.
+if (TRUE) {
+
+    ## Count the times when it gets used in quick success.
+    ## lastTIme holds the last ending time for a station.
+    ## quickHits holds the list of quick hits
+    lastTime = c()
+    quickHits = c()
+    for (index in seq(1,nrow(chargeData))) {
+        stationName = as.character(chargeData$Station.Name[index])
+        
+        if (length(which(names(lastTime) == stationName)) == 0) {
+            lastTime[stationName] = index
+        } else {
+          difference = difftime(startTime[index],
+                                endTime[lastTime[stationName]],
+                                units='hours')
+           if (difference < 1) {
+                quickHits = c(quickHits,stationName)
+                
+            }
+        }
+    }
+
+    ## Now use MGHH and naive to find most quick hits
+    quickHitters = heavyHitters(quickHits,50,10)
+    quickCount = countElements(quickHits,10)
+
+    allNames = unique(c(names(quickHitters),names(quickCount)))
+    tableData = matrix(0,nrow=length(allNames),ncol=2)
+    for (index in seq(1,length(allNames))) {
+        name = allNames[index]
+        if (length(which(name == names(quickCount))) > 0) {
+            tableData[index,1] = as.integer(quickCount[name])
+        }
+        if (length(which(name == names(quickHitters))) > 0) {
+            tableData[index,2] = as.integer(quickHitters[name])
+        }
+    }
+    colnames(tableData) = c("Naive","MGHH")
+    rownames(tableData) = allNames
+    plot.new()
+    grid.table(tableData)
+}

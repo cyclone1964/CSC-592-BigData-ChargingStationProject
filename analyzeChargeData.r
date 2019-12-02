@@ -1,7 +1,321 @@
+## This is a simple script to try to analyze the data in the charging
+## database. These are the libraries we need.
+library('lubridate')
+library('gridExtra')
+library('grid')
+library('igraph')
+library('openssl')
+library('zipcode')
+
+## cleanData - clean the charging station data
+##
+## This function cleans the input data by doing the following
+##
+## Removing entries with bad data in them
+## Adding a Start.Time and End.Time field 
+## Sorts entries by Start.Time
+##
+## Arguments
+## chargeData - the input chargeData frame
+##
+## returns
+##
+## chargeData - the cleaned data
+cleanData <- function(chargeData) {
+    
+    ## First, get rid of the entries with missing fields of interest
+    goodIndices = which(chargeData$User.ID != "" &
+                        chargeData$User.ID != "0" & 
+                        chargeData$End.Date != "" & 
+                        chargeData$Start.Date != "" &
+                        chargeData$Total.Duration..hh.mm.ss. != "")
+    chargeData = chargeData[goodIndices,]
+    
+    ## Let's sort them by starting time
+    startTime = as.POSIXct(chargeData$Start.Date,format="%m/%d/%y %H:%M")
+    chargeData = chargeData[order(unlist(startTime)),]
+
+    ## take out those that have durations that are too long
+    duration = hms(chargeData$Total.Duration)
+    duration = as.numeric(duration)
+    indices = which(duration < 7*24*60*60 & duration > 5*60)
+    chargeData = chargeData[indices,]
+
+    ## Parse the start and end time columns
+    startTime = as.POSIXct(chargeData$Start.Date,format="%m/%d/%y %H:%M")
+    endTime = as.POSIXct(chargeData$End.Date,format="%m/%d/%y %H:%M")
+
+    ## Also compute the duration in hours
+    duration = hms(chargeData$Total.Duration)
+    duration = as.numeric(duration)/3600
+
+    ## Add times to the data frame
+    chargeData$Start.Time = startTime
+    chargeData$End.Time = endTime
+    chargeData$Duration = duration
+    
+    ## Now let's remove all occurences of this string from station names
+    chargeData$Station.Name = gsub("NATIONAL GRID / ","",
+                                   chargeData$Station.Name)
+
+    ## Now, there are repeats in there due to formatting: take
+    ## out the #, ', and spaces
+    chargeData$Station.Name = gsub("[# ']","",
+                                   chargeData$Station.Name)
+
+    ## Now, let's convert all the zip codes to only 5 digits
+    ## by removing anything after a -
+    chargeData$Driver.Postal.Code = sub("-.*","",
+                                        chargeData$Driver.Postal.Code)
+    
+    return(chargeData)
+}
+##heavyHitters - heavy hitters algorithm as described in Misra-Griegs
+##
+## This is an implementation of the "Heavy Hitters" algorithm of
+## Misra-Griegs.
+##
+## Arguments:
+##
+## hitterList - a list of unique names: each nameis a node.
+## hitterLimit - the value k in the M-G paper.
+## numReturn - the number of entries to return
+##
+## Returns:
+##
+## heavyHitters - a named list, with each named entry the count for the entry.
+##
+heavyHitters <- function(hitterList,hitterLimit,numReturn = -1) {
+    
+    ## The killer here is that R does not natively support a
+    ## dictionary, at least not really. So I am going to use named
+    ## lists for the same thing. I have no idea how they are
+    ## implemented but it may not be the most efficient storage
+    ## methodology.
+    
+    ## Initialize the hitCounts
+    hitCount = list()
+    
+    ## Now, for every hitter in the incoming list ...  
+    for (hitter in hitterList) {
+
+        ## ... Convert it to a character (it's some weird factor thing)...
+        name = as.character(hitter)
+        
+        ## ... and find which of the current hitCounts that corresponds to.
+        index = which(names(hitCount) == name)
+        
+        if (length(index) == 1) {
+            ## If this name exists in the list, increment the list
+            hitCount[name] = as.integer(hitCount[name]) + 1
+        } else  if (length(hitCount) < hitterLimit) {
+            ## If not, but there are not too many hitters, 
+            ## add it to the list with a count of 1
+            hitCount[name] = 1
+        } else {
+            ## Otherwise, decrement all the counts and remove the 0 ones
+            hitCount[names(hitCount)] =
+                as.integer(hitCount[names(hitCount)]) -1 
+            hitCount[which(hitCount == 0)] = NULL
+        }
+    }
+    
+    ## Sort and reduce the list as needed
+    hitCount = hitCount[order(unlist(hitCount),decreasing=TRUE)]
+    if (numReturn > 0 && length(hitCount) > numReturn) {
+        hitCount = hitCount[1:numReturn]
+    }
+    
+    ## Return the list
+    return (hitCount)
+}
+##countElementNames - countElements in a list 
+##
+## This function simply counts the occurances of a name in a list. It
+## returns a named list in sorted order limited to a specific size if
+## so indicated.
+##
+## Arguments
+## elementNames - list of element names
+## numReturn - the maximum number to return
+##
+## Returns
+## named list of count for each name.
+countElementNames <-  function(elementNames,numReturn = -1) {
+
+    count = list()
+    for (name in elementNames) {
+        
+        ## Does that name exist in the list already?
+        index=which(names(count)==name)
+        if (length(index) ==1) {
+            ## If so, increment the count
+            count[name] = as.numeric(count[name]) + 1
+        } else {
+            ## Otherwise, add it to the list
+            count[name] = 1
+        }
+    }
+
+    ## Sort them in decreasing order
+    count = count[order(unlist(count),decreasing=TRUE)]
+
+    ## Downselect the list and return the counts
+    if (numReturn > 0 && length(count) > numReturn) {
+        count = count[1:numReturn]
+    }
+    return(count)
+}
+##computeLoading - compute the loading for stations in a single pass
+##
+## This function returns the loading for the stations in the
+## chargeData data frame in a streaming fashion, which is assumed to
+## have the following fields:
+##
+## Station.Name - the unique name of each station
+## Start.Time - the start time of each session
+## End.Time - the end time of each session
+##
+## Arguments
+## chargeData - a data frame of charging data augmented as necessary
+##
+## Returns
+## loading - a named list of loading for each station
+computeLoading <- function(chargeData)
+{
+    loading = c()
+    sessions = c()
+    firstTime = c()
+    for (index in seq(1,nrow(chargeData))) {
+        name = as.character(chargeData$Station.Name[index])
+        if (length(which(name == names(loading))) == 0) {
+            loading[name] = difftime(chargeData$End.Time[index],
+                                     chargeData$Start.Time[index],
+                                     units = "hours")
+            firstTime[name] = index
+            sessions[name] = 1
+        } else {
+            loading[name] = loading[name] +
+                difftime(chargeData$End.Time[index],
+                         chargeData$Start.Time[index],
+                         units = "hours")
+            sessions[name] = sessions[name] + 1
+        }
+    }
+    for (name in names(loading)) {
+        totalTime = difftime(chargeData$End.Time[nrow(chargeData)],
+                             chargeData$Start.Time[firstTime[name]],
+                             units = "hours")
+        loading[name] = loading[name]/as.numeric(totalTime)
+        sessions[name] = sessions[name]/(as.numeric(totalTime)/24)
+    }
+    loading = loading[order(unlist(loading),decreasing=TRUE)]
+    sessions = sessions[order(unlist(sessions),decreasing=TRUE)]
+    temp = c()
+    temp$Loading = loading
+    temp$Sessions = sessions
+    return(temp)
+}
+## quickHitters - look for quick hitters
+##
+## this funtion finds "quick hitters" in the sense that it counts the
+## number sessions that follow within a few moments of another
+## session., in this case an hour by default.
+##
+## Arguments:
+## chargeData - the chargeData DataFrame
+## period - the time limit for declaring a quick hit
+##
+## Returns
+## a named list of counts of quick hits
+quickHitters <- function(chargeData, period = 1) {
+
+    ## Count the times when it gets used in quick success.
+    ## lastTIme holds the last ending time for a station.
+    ## quickHits holds the list of quick hits
+    lastTime = c()
+    quickHits = c()
+    for (index in seq(1,nrow(chargeData))) {
+
+        ## Get the staion name as a list lookup
+        stationName = as.character(chargeData$Station.Name[index])
+
+        ## If it's not there, add it, otherwise compute the length of
+        ## the time between sessions and check to see if it sover the
+        ## period.
+        if (length(which(names(lastTime) == stationName)) == 0) {
+            lastTime[stationName] = index
+        } else {
+          difference = difftime(chargeData$Start.Time[index],
+                                chargeData$End.Time[lastTime[stationName]],
+                                units='hours')
+           if (difference < period) {
+                quickHits = c(quickHits,stationName)
+                
+           }
+          lastTime[stationName] = index
+        }
+    }
+
+    return(quickHits)
+}
+##buildEdgeList - build a list of edges
+##
+## This function builds a list of edges and returns them along with some
+## bookkeeping information
+##
+## Arguments:
+## chargeData - the input data frame
+##
+## Returns:
+## named list with the following entries:
+##
+## "edgeList" - an edge list, an Nx2 matrix of vertex integers
+## "vertexNames" - a vector of names for the vertexes
+## "vertexIndices" - named list of indices for each vertex
+buildEdgeList <- function(chargeData) {
+    
+    ## Now lets set up a matrix for the graph edges. For this one, we
+    ## treat the userIds and station names as vertices: assign them
+    print("Load adjacency list")
+    numVertices = 0
+    vertexNames = c()
+    vertexNumbers = c()
+
+    for (stationName in unique(chargeData$Station.Name)) {
+        numVertices = numVertices + 1
+        vertexNumbers[stationName] = numVertices
+        vertexNames[numVertices] = stationName
+    }
+    numStations = numVertices
+    for (userId in unique(chargeData$User.ID)) {
+      numVertices = numVertices + 1
+      vertexNumbers[userId] = numVertices
+      vertexNames[numVertices] = userId
+    }
+    numUsers = numVertices - numStations
+    edgeList = matrix(0,nrow = nrow(chargeData), ncol = 2)
+    for (index in 1:nrow(chargeData)) {
+        edgeList[index,1] = vertexNumbers[chargeData$User.ID[index]]
+        edgeList[index,2] = vertexNumbers[chargeData$Station.Name[index]]
+    }
+    print(paste("Found ",numUsers," users and ", numStations," Stations"))
+    temp = c()
+    temp$Edge.List = edgeList
+    temp$Vertex.Names = vertexNames
+    temp$Vertex.Numbers = vertexNumbers
+    return(temp)
+}
 ##makeCommunities - streaming community generator as described in Hollocau et al
 ##
+##
+## Arguments
 ## edgeList - an M x 2 list of edges, each entry is an integer.
 ## vMax - the maximum volume
+## numVertices - the number of unique vertices in the edgeList
+##
+## Returns
+## communities - a named list for each vertex of which community they belong
 makeCommunities <- function(edgeList, vMax, numVertices) {
 
     ## This is meant to be an R implementation as seen on page 4.
@@ -74,137 +388,26 @@ makeCommunities <- function(edgeList, vMax, numVertices) {
 
     return(communities)
 }
-##heavyHitters - heavy hitters algorithm as described in Misra-Griegs
-heavyHitters <- function(hitterList,numHitters,numReturn = -1) {
-    
-    ## The killer here is that R does not natively support a
-    ## dictionary, at least not really. So I am going to use named
-    ## lists for the same thing. I have no idea how they are
-    ## implemented but it may not be the most efficient storage
-    ## methodology.
-    
-    ## Initialize the hitCounts
-    hitCount = list()
-    
-    ## Now, for every hitter in the incoming list ...  
-    for (hitter in hitterList) {
-        ## ... Convert it to a character (it's some weird factor thing)...
-        name = as.character(hitter)
-        
-        ## ... and find which of the current hitCounts that corresponds to.
-        index = which(names(hitCount) == name)
-        
-        if (length(index) == 1) {
-            ## If this name exists in the list, increment the list
-            hitCount[name] = as.integer(hitCount[name]) + 1
-        } else  if (length(hitCount) < numHitters) {
-            ## If not, but there are not too many hitters, 
-            ## add it to the list with a count of 1
-            hitCount[name] = 1
-        } else {
-            ## Otherwise, decrement all the counts and remove the 0 ones
-            hitCount[names(hitCount)] =
-                as.integer(hitCount[names(hitCount)]) -1 
-            hitCount[which(hitCount == 0)] = NULL
-        }
-    }
-    
-    ## Sort and reduce the lis as needed
-    hitCount = hitCount[order(unlist(hitCount),decreasing=TRUE)]
-    if (numReturn > 0 && length(hitCount) > numReturn) {
-        hitCount = hitCount[1:numReturn]
-    }
-    
-    ## Return the list
-    return (hitCount)
-}
-## This function computes the counts for each unique data input by
-## simply going through the list and counting each unique entity
-countElements <-  function(elements,numReturn = -1) {
-
-    count = list()
-    for (name in elements) {
-        
-        ## Does that name exist in the list already?
-        index=which(names(count)==name)
-        if (length(index) ==1) {
-            ## If so, increment the count
-            count[name] = as.numeric(count[name]) + 1
-        } else {
-            ## Otherwise, add it to the list
-            count[name] = 1
-        }
-    }
-
-    ## Sort them in decreasing order
-    count = count[order(unlist(count),decreasing=TRUE)]
-
-    ## Downselect the list and return the counts
-    if (numReturn > 0 && length(count) > numReturn) {
-        count = count[1:numReturn]
-    }
-    return(count)
-}
-
-## This is a simple script to try to analyze the data in the charging
-## database At this point it's just testing the heavyhitters algorithm
-## on our data First, use the lubridate library: this lets us parse
-## times directory in the CSV
-library('lubridate')
-library('gridExtra')
-library('grid')
-library('igraph')
-library('openssl')
-library('zipcode')
-
+## Now, the actual program: first, read the charge data if necessary
 if (!exists("chargeData")) {
 
     ## Read the data
-    chargeData = read.csv("RI-ChargingData-2019-10-10.csv", stringsAsFactors=FALSE)
-    
-    ## Now, get rid of the entries with missing fields of interest
-    goodIndices = which(chargeData$User.ID != "" &
-                        chargeData$User.ID != "0" & 
-                        chargeData$End.Date != "" & 
-                        chargeData$Start.Date != "" &
-                        chargeData$Total.Duration..hh.mm.ss. != "")
-    chargeData = chargeData[goodIndices,]
-    
-    ## Let's sort them by starting time
-    startTime = as.POSIXct(chargeData$Start.Date,format="%m/%d/%y %H:%M")
-    chargeData = chargeData[order(unlist(startTime)),]
-
-    ## Parse the start and end time columns
-    startTime = as.POSIXct(chargeData$Start.Date,format="%m/%d/%y %H:%M")
-    endTime = as.POSIXct(chargeData$End.Date,format="%m/%d/%y %H:%M")
-
-    ## Find the ones that are in EDT and add an hour
-    edtIndices = which(chargeData$Start.Time.Zone=="EDT")
-    startTime[edtIndices] = startTime[edtIndices] + 3600
-    endTime[edtIndices] = endTime[edtIndices] + 3600
-    
-    ## Now let's remove all occurences of this string rom station names
-    chargeData$Station.Name = gsub("NATIONAL GRID / ","",
-                                   chargeData$Station.Name)
-
-    ## Now, there are repeast in there due to formatting: take
-    ## out the #, ', and spaces
-    chargeData$Station.Name = gsub("[# ']","",
-                                   chargeData$Station.Name)
-
+    chargeData = read.csv("RI-ChargingData-2019-10-10.csv",
+                          stringsAsFactors=FALSE)
+    chargeData = cleanData(chargeData)
 }
-## This is the station heavy hitter analysis
+
+## This is the station heavy hitter analysis and associated plots
 if (!exists("stationHitters")) {
     
     ## Now invoke the heavy hitters algorithm. We ask for the top 10
     ## then whittle it down to the top 10 for analysis. 
-    print("First, run Misra-Gries looking for only the top 10 stations")
-    
+    print("Run Misra-Gries looking for only the top 10 stations")
     stationHitters = heavyHitters(chargeData$Station.Name, 10, 10)
-    stationCount = countElements(chargeData$Station.Name, 10)
+    stationCount = countElementNames(chargeData$Station.Name, 10)
     
     ## Now, let's combine them into a table for plotting
-    allNames = unique(c(names(stationHitters),names(stationCount)))
+    allNames = unique(c(names(stationCount),names(stationHitters)))
     print('Station: M-G naive');
     tableData = matrix(0,nrow=length(allNames),ncol=2,byrow=TRUE)
     for (index in seq(1,length(allNames))) {
@@ -221,12 +424,8 @@ if (!exists("stationHitters")) {
     colnames(tableData) = c("\nCount","Count\nM-G");
     plot.new()
     grid.table(tableData)
-    
-    print("Notice that there is almost no agreement there.")
-    print("This is because M-G does not work well when there are insufficient")
-    print("Entries for the top hitters. Try it again with 50 table entries")
-    print("and keep just the top 10")
-    
+
+    ## Now do it for the hitters with k=50
     stationHitters = heavyHitters(chargeData$Station.Name, 50, 10)
     allNames = unique(c(names(stationHitters),names(stationCount)))
     print('Station: M-G naive');
@@ -246,15 +445,12 @@ if (!exists("stationHitters")) {
     plot.new()
     grid.table(tableData)
 
-
-    print("Notice we have good agreement here.")
-    
-    print("Now, let's do it for an increasing number of bins")
+    ## Now try it for different values of k
     tableData = matrix(0,nrow=5,ncol=2,byrow=TRUE)
     for (index in seq(1,5)) {
       numBins = index * 10
       stationHitters = heavyHitters(chargeData$Station.Name, numBins, 10)
-      stationCount = countElements(chargeData$Station.Name, 10)
+      stationCount = countElementNames(chargeData$Station.Name, 10)
       
       numMatches = 0
       for (name in names(stationCount)) {
@@ -267,26 +463,19 @@ if (!exists("stationHitters")) {
       tableData[index,2] = round(100*numMatches/10)
       print(paste('numBins: ',numBins,'Match',numMatches/10))
     }
-    rownames(tableData) <- 10*seq(1,5)
-    colnames(tableData) <-  c("# Bins","Top 10 \nAccuracy (%)")
+    colnames(tableData) <-  c("k","Top 10 \nAccuracy (%)")
     plot.new()
     grid.table(tableData)
 }
 
-
 ## Now let's try the same thing with users: however, we need to do
-## this for different levels
-
+## this for different settings of k since there are so many users
 if (!exists("userHitters")) {
-    print("Now, there are only 79 stations in the data base, so picking the")
-    print("top 50 was almost exhaustive. Let's do the same thing with users")
-    print("of which there are over 4000. Let's use M-G to find the top N")
-    print(" users for values of N between 10 and 100 and make a table")
-    print(" of the agreement.");
-    tableData = matrix(0,ncol=10,nrow=2,byrow = TRUE)
+    print("Use Misra-Gries at various settings of k on users")
+    tableData = matrix(0,ncol=2,nrow=10,byrow = TRUE)
     for (index in seq(1,10)) {
         numBins = 50 * index
-        userCount = countElements(chargeData$User.ID,numBins)
+        userCount = countElementNames(chargeData$User.ID,numBins)
         userHitters = heavyHitters(chargeData$User.ID,numBins,numBins)
         
         ## compute the number of matches: we do this by catenating the
@@ -298,34 +487,35 @@ if (!exists("userHitters")) {
                 numMatches = numMatches + 1
             }
         }
-        tableData[1, index] = numBins
-        tableData[2,index] = round(100*numMatches/numBins)
+        tableData[index, 1] = numBins
+        tableData[index, 2] = round(100*numMatches/numBins)
         print(paste('NumBins: ',numBins,'Match',numMatches/numBins))
     }
-    colnames(tableData) <- 50*seq(1,10)
-    rownames(tableData) <-  c("# Bins","Accuracy (%)")
+    colnames(tableData) <-  c("k","Accuracy (%)")
     plot.new()
     grid.table(tableData)
 }
 
+## Now let's compute the business of the stations, specifically the
+## average number of session per day and the loading (percentage of
+## time) it is used
 if (!exists("sessionsPerDay")) {
+
+    ## Compute the running sums
+    print("Compute loading of stations")
+    stationCounts = countElementNames(chargeData$Station.Name,10)
+    temp = computeLoading(chargeData)
+    stationLoading = temp$Loading
+    sessionsPerDay = temp$Sessions
+
     ## Having done, that, let's look at the station heavy hitters and
     ## determine how "saturated" they are, which is to say how much of the
     ## time they are full. We can do this easily by summing up the
     ## "duration" column.
-    duration = hms(chargeData$Total.Duration)
-    duration = as.numeric(duration)/(3600)
-    tableData = matrix(0,nrow = length(stationCount),ncol=1,byrow=TRUE)
-    stationNames = names(stationCount)
+    tableData = matrix(0,nrow = length(stationCounts),ncol=1,byrow=TRUE)
+    stationNames = names(stationCounts)
     for (index in seq(1,length(stationNames))) {
-        stationName = stationNames[index]
-        stationIndices = which(chargeData$Station.Name == stationName)
-        totalTime = max(endTime[stationIndices]) -
-            min(startTime[stationIndices])
-        totalTime = as.numeric(totalTime)*24;
-        totalDuration = sum(duration[stationIndices])
-        print(paste(stationName, " Loading: ",100 * totalDuration/totalTime))
-        tableData[index,1] = round(100*totalDuration/totalTime)
+        tableData[index,1] = round(100*stationLoading[stationNames[index]])
     }
     rownames(tableData) = stationNames
     colnames(tableData) = c("Loading (%)")
@@ -333,53 +523,24 @@ if (!exists("sessionsPerDay")) {
     grid.table(tableData)
     print(" Notice that some of these are really REALLY high")
 
-    ## Now, for fun, let's compute the average number of charging
-    ## sessions per day for each station.
-    stationNames = unique(chargeData$Station.Name)
-    sessionsPerDay = c()
-    for (stationName in stationNames) {
-        stationIndices = which(chargeData$Station.Name == stationName)
-        numSessions = length(stationIndices)
-        totalDays = max(endTime[stationIndices]) -
-            min(startTime[stationIndices])
-        sessionsPerDay[stationName] = numSessions/as.numeric(totalDays);
-    }
-    stationBusinessOrder = order(unlist(sessionsPerDay),decreasing=TRUE)
-    sessionsPerDay = sessionsPerDay[stationBusinessOrder]
-    plot.new()
     plot(sessionsPerDay,
          type='o',
          ylab = 'Sessions Per Day', 
          main = 'Station Usage (Sorted)')
 }
 
-if (!exists("numVertices")) {
-    ## Now lets set up a matrix for the graph edges. For this one, we
-    ## treat the userIds and station names as vertices: assign them
-    print("Load adjacency list")
-    numVertices = 0
-    vertexNumber = c()
-    vertexNames = c()
+## Now, let's try finding some communities using the algorithm. To do
+## this we need to build a graph, which is in this case is an
+## undirected multi-graph. with each Station and User a vertex and an
+## edge between them when there's a session.
+if (!exists("edgeList")) {
 
-    for (stationName in unique(chargeData$Station.Name)) {
-        numVertices = numVertices + 1
-        vertexNumber[stationName] = numVertices
-        vertexNames[numVertices] = stationName
-    }
-    numStations = numVertices
-    for (userId in unique(chargeData$User.ID)) {
-      numVertices = numVertices + 1
-      vertexNumber[userId] = numVertices
-      vertexNames[numVertices] = userId
-    }
-    numUsers = numVertices - numStations
-    edgeList = matrix(0,nrow = nrow(chargeData), ncol = 2)
-    for (index in 1:nrow(chargeData)) {
-        edgeList[index,1] = vertexNumber[chargeData$User.ID[index]]
-        edgeList[index,2] = vertexNumber[chargeData$Station.Name[index]]
-    }
-    print(paste("Found ",numUsers," users and ", numStations," Stations"))
-    
+    temp = buildEdgeList(chargeData)
+    edgeList = temp$Edge.List
+    vertexNames = temp$Vertex.Names
+    vertexIndices = temp$Vertex.Indices
+    numVertices = length(vertexNames)
+
     ## This function returns the community ID for every vertex in the
     ## list. Note that these need not be sequential
     vMax = 70000
@@ -438,33 +599,36 @@ if (!exists("numVertices")) {
     plot.new()
     grid.table(tableData)
 }
-if (!exists('monthlyClosenessCentrality')) {
-    ## first, let's make a graph from the entire edge list
-    print("Let's try a plot of closness centrality for all of the ")
-    print("stations as a function of month")
+
+## Now, lets try some experiments with closeness Centrality.
+if (!exists('chargeGraph')) {
+
+    ## First, let's make a graph from the entire edge list
+    print("Plot of closeness centrality as a function of month")
     chargeGraph =
         graph(as.vector(t(uniqueEdgeList)),n=numVertices,directed=FALSE)
 
     ## Now, let's compute the centrality of all the stations across
-    ## the entire time (using the weights) and see what that looks
+    ## the entire time (using no weights) and see what that looks
     ## like.
     allCloseness = closeness(chargeGraph,
-                             vids = stationBusinessOrder,
+                             vids = seq(1,length(stationNames)),
                              mode="all",
                              normalized=TRUE)
-    plot.new()
     plot(allCloseness,
          xlab='Station (Ordered by Busyness)',
          ylab='Closeness Centrality',
          main='Station Closeness Centrality (All Data)');
          
-    ## Now, get the year of the first and last time
+    ## Now, let's compute the centrality of each o the stations on a
+    ## monthy basis to see if thre's any sort of trend. 
     monthlyClosenessCentrality = c()
     periodDates = c()
-    for (thisYear in seq(year(startTime[1]),year(endTime[length(endTime)]))){
+    for (thisYear in seq(year(chargeData$Start.Time[1]),
+                         year(chargeData$End.Time[nrow(chargeData)]))) {
         for (thisMonth in seq(1,12)) {
-            monthIndices = which(year(startTime) == thisYear &
-                                 month(startTime) == thisMonth)
+            monthIndices = which(year(chargeData$Start.Time) == thisYear &
+                                 month(chargeData$Start.Time) == thisMonth)
             if (length(monthIndices) > 1) {
                 monthEdgeList = edgeList[monthIndices,];
                 uniqueMonthEdgeList = unique(monthEdgeList)
@@ -477,12 +641,13 @@ if (!exists('monthlyClosenessCentrality')) {
                                      monthEdgeList[,2] ==
                                      uniqueMonthEdgeList[index,2]))
                 }
-                periodDates = c(periodDates,startTime[monthIndices[1]])
+                periodDates = c(periodDates,
+                                chargeData$Start.Time[monthIndices[1]])
                 temp = graph(as.vector(t(uniqueMonthEdgeList)),
                              n=length(unique(as.vector(uniqueMonthEdgeList))),
                              directed=FALSE)
                 monthCloseness = closeness(temp,
-                                           vids = seq(1,numStations),
+                                           vids = seq(1,length(stationNames)),
                                            mode="all",
                                            normalized = TRUE)
 
@@ -501,14 +666,13 @@ if (!exists('stationUserCount')) {
 
     ## Let's go through and count the number of unique users for each station
     stationUserCount = c()
-    for (stationName in stationNames) {
+    for (stationName in names(sessionsPerDay)) {
         indices = which(chargeData$Station.Name == stationName)
         stationUserCount[stationName] =
             length(unique(chargeData$User.ID[indices]))
     }
 
-    plot.new()
-    plot(stationUserCount[stationBusinessOrder],
+    plot(stationUserCount,
          xlab='Station (Sorted)',
          ylab='# Unique Users',
          main='Station Unique User Count')
@@ -516,8 +680,7 @@ if (!exists('stationUserCount')) {
 
 ## Now, that's interesting. So the next question is to check the
 ## promiscuity of users with respect to stations
-
-if (TRUE) {
+if (!exists("userStationCount")) {
     ## Let's go through and count the number of unique users for each station
     userStationCount = c()
     for (userId in unique(chargeData$User.ID)) {
@@ -525,14 +688,7 @@ if (TRUE) {
         userStationCount[userId] =
             length(unique(chargeData$Station.Name[indices]))
     }
-
-    plot.new()
-    plot(userStationCount,
-         xlab='User (UnSorted)',
-         ylab='# Unique Users',
-         main='Station Unique User Count')
     
-    plot.new()
     data = hist(userStationCount,breaks = seq(0,30),plot=FALSE);
     barplot(pmin(100,data$counts),
             ylab='# of Users ',
@@ -543,45 +699,21 @@ if (TRUE) {
 ## Now let's see if we can identify times when charging stations are
 ## used in quick succession. We can use this as an indication that a
 ## specific station is could stand to be upgraded to more slots.
-if (TRUE) {
-
-    ## Count the times when it gets used in quick success.
-    ## lastTIme holds the last ending time for a station.
-    ## quickHits holds the list of quick hits
-    lastTime = c()
-    quickHits = c()
-    for (index in seq(1,nrow(chargeData))) {
-        stationName = as.character(chargeData$Station.Name[index])
-        
-        if (length(which(names(lastTime) == stationName)) == 0) {
-            lastTime[stationName] = index
-        } else {
-          difference = difftime(startTime[index],
-                                endTime[lastTime[stationName]],
-                                units='hours')
-           if (difference < 1) {
-                quickHits = c(quickHits,stationName)
-                
-            }
-        }
-    }
+if (!exists("quickHits")) {
+    quickHits = quickHitters(chargeData)
 
     ## Now use MGHH and naive to find most quick hits
-    quickHitters = heavyHitters(quickHits,50,10)
-    quickCount = countElements(quickHits,10)
+    quickCount = countElementNames(quickHits,10)
 
-    allNames = unique(c(names(quickHitters),names(quickCount)))
-    tableData = matrix(0,nrow=length(allNames),ncol=2)
+    allNames = names(quickCount)
+    tableData = matrix(0,nrow=length(allNames),ncol=1)
     for (index in seq(1,length(allNames))) {
         name = allNames[index]
         if (length(which(name == names(quickCount))) > 0) {
             tableData[index,1] = as.integer(quickCount[name])
         }
-        if (length(which(name == names(quickHitters))) > 0) {
-            tableData[index,2] = as.integer(quickHitters[name])
-        }
     }
-    colnames(tableData) = c("Naive","MGHH")
+    colnames(tableData) = c("QuickHits")
     rownames(tableData) = allNames
     plot.new()
     grid.table(tableData)

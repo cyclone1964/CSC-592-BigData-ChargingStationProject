@@ -4,8 +4,12 @@ library('lubridate')
 library('gridExtra')
 library('grid')
 library('igraph')
-library('openssl')
 library('zipcode')
+library('geosphere')
+library('Rtsne')
+library('umap')
+
+data(zipcode)
 
 ## cleanData - clean the charging station data
 ##
@@ -24,22 +28,29 @@ library('zipcode')
 cleanData <- function(chargeData) {
     
     ## First, get rid of the entries with missing fields of interest
+    print(paste("Raw data set has ",nrow(chargeData), " records"))
     goodIndices = which(chargeData$User.ID != "" &
                         chargeData$User.ID != "0" & 
                         chargeData$End.Date != "" & 
                         chargeData$Start.Date != "" &
                         chargeData$Total.Duration..hh.mm.ss. != "")
     chargeData = chargeData[goodIndices,]
+    print(paste("Editing for bad User ID, start and end dates,",
+                "and duration leaves ",nrow(chargeData), " records"))
     
     ## Let's sort them by starting time
+    print("Sort data by start date")
     startTime = as.POSIXct(chargeData$Start.Date,format="%m/%d/%y %H:%M")
     chargeData = chargeData[order(unlist(startTime)),]
 
     ## take out those that have durations that are too long
+    print("Remove durations in ecess of a week or less than 5 minutes")
     duration = hms(chargeData$Total.Duration)
     duration = as.numeric(duration)
     indices = which(duration < 7*24*60*60 & duration > 5*60)
     chargeData = chargeData[indices,]
+    print(paste("Editing for bad duration leaves ",
+                nrow(chargeData), " records"))
 
     ## Parse the start and end time columns
     startTime = as.POSIXct(chargeData$Start.Date,format="%m/%d/%y %H:%M")
@@ -67,8 +78,72 @@ cleanData <- function(chargeData) {
     ## by removing anything after a -
     chargeData$Driver.Postal.Code = sub("-.*","",
                                         chargeData$Driver.Postal.Code)
+
+    ## Now let's convert the zip codes to actual numbers and get rid
+    ## of ones that fail
+    chargeData$Postal.Code = clean.zipcodes(chargeData$Postal.Code)
+    chargeData$Driver.Postal.Code = clean.zipcodes(chargeData$Driver.Postal.Code)
+    chargeData = chargeData[which(!is.na(chargeData$Driver.Postal.Code)),]
+    print(paste("Removing bad zip codes leaves ",nrow(chargeData)," records"))
+
+    ## Now let's remove zipcodes that are not in new england.
+    localCodes = zipcode[which(zipcode$state == "RI" |
+                               zipcode$state == "MA" |
+                               zipcode$state == "CT"),]
+
+    ## Now let's sort the reduced data base entry by zip code
+    localCodes = localCodes[order(as.numeric(localCodes$zip)),]
+
+    ## Now find the first and last entry in that list
+    temp = as.numeric(localCodes$zip)
+    firstCode = temp[1]
+    lastCode = temp[length(temp)]
+
+    ## load a matrix with the lat/long
+    geoTable = matrix(nrow = lastCode-firstCode+1, ncol=2, byrow = TRUE)
+    geoTable[temp-firstCode+1,1] = localCodes$latitude
+    geoTable[temp-firstCode+1,2] = localCodes$longitude
+
+    ## Now lets remove any entries in the data base with postal codes
+    ## out of that range.
+    temp = as.numeric(chargeData$Driver.Postal.Code)
+    chargeData = chargeData[which(temp >= firstCode & temp <= lastCode),]
+    print(paste("Removing non-New England zip codes leaves ",
+                nrow(chargeData)," records"))
+
+    ## now compute the distance by getting the lat and long for the
+    ## station and the driver and computing the geodesic.
+    stationIndices = as.numeric(chargeData$Postal.Code)-firstCode+1
+    userIndices = as.numeric(chargeData$Driver.Postal.Code)-firstCode+1
+    stationPoints = geoTable[stationIndices,]
+    userPoints = geoTable[userIndices,]
+    chargeData$Distance = distGeo(stationPoints,userPoints)
+    chargeData$User.Latitude = geoTable[userIndices,1]
+    chargeData$User.Longitude = geoTable[userIndices,2]
+    chargeData$Station.Latitude = geoTable[stationIndices,1]
+    chargeData$Station.Longitude = geoTable[stationIndices,2]
+
+    ## Now get rid of the ones that have NA in them
+    chargeData = chargeData[!is.na(chargeData$Distance),]
+
+    ## Now let's enumerate the station and the users
+    numVertices = 1
+    vertices = matrix(nrow =nrow(chargeData), ncol=1)
+    for (name in unique(chargeData$Station.Name)) {
+        vertices[which(chargeData$Station.Name == name)] = numVertices
+        numVertices = numVertices + 1
+    }
+    chargeData$Station.Vertex = vertices
+
+    numVertices = 1
+    vertices = matrix(nrow =nrow(chargeData), ncol=1)
+    for (name in unique(chargeData$User.ID)) {
+        vertices[which(chargeData$User.ID == name)] = numVertices
+        numVertices = numVertices + 1
+    }
+    chargeData$User.Vertex = vertices
     
-    return(chargeData)
+   return(chargeData)
 }
 ##heavyHitters - heavy hitters algorithm as described in Misra-Griegs
 ##
@@ -388,6 +463,8 @@ makeCommunities <- function(edgeList, vMax, numVertices) {
 
     return(communities)
 }
+## Now to support the PCA analysis, we have to create a matrix for the data elements for which that makes sense. Specifically: start hour of the day, duration, distance from home, total energy, 
+
 ## Now, the actual program: first, read the charge data if necessary
 if (!exists("chargeData")) {
 
@@ -475,14 +552,14 @@ if (!exists("userHitters")) {
     tableData = matrix(0,ncol=2,nrow=10,byrow = TRUE)
     for (index in seq(1,10)) {
         numBins = 50 * index
-        userCount = countElementNames(chargeData$User.ID,numBins)
+        userCounts = countElementNames(chargeData$User.ID,numBins)
         userHitters = heavyHitters(chargeData$User.ID,numBins,numBins)
         
         ## compute the number of matches: we do this by catenating the
         ## names in both, uniquing that, and the number that the
         ## unique removed are the number that don't match
         numMatches = 0
-        for (name in names(userCount)) {
+        for (name in names(userCounts)) {
             if (length(which(name == names(userHitters))) == 1) {
                 numMatches = numMatches + 1
             }
@@ -495,7 +572,6 @@ if (!exists("userHitters")) {
     plot.new()
     grid.table(tableData)
 }
-
 ## Now let's compute the business of the stations, specifically the
 ## average number of session per day and the loading (percentage of
 ## time) it is used
@@ -718,3 +794,151 @@ if (!exists("quickHits")) {
     plot.new()
     grid.table(tableData)
 }
+
+## Now, lets do a simple PCA on a reduced data set.
+if (!exists("reducedChargeData")) {
+
+    ## First, t-SNE and UMAP embeddings on a 6 dimension set
+    reducedChargeData = cbind(round(hour(chargeData$Start.Time)),
+                              chargeData$Duration,
+                              chargeData$Energy..kWh,
+                              chargeData$Distance,
+                              chargeData$Station.Vertex,
+                              chargeData$User.Vertex)
+
+    ## Most of the coloring options we implement can be done directly
+    ## from the reduced data set, but the coloring by heavy hitter
+    ## user id has to be done in the chargeData data space in order to
+    ## use the list of userCounts
+    colors = rainbow(length(userCounts)+1)
+    userColors=matrix(0,nrow=nrow(chargeData),ncol=1)
+    index = 1
+    for (name in names(userCounts)) {
+          userColors[chargeData$User.ID == name] = colors[index]
+          index = index+1
+    }
+    userColors[userColors == 0] = colors[length(colors)]
+    rm("colors")
+
+    ## Now reduce the data by a factor of 16 and set up the colorings
+    reducedChargeData = reducedChargeData[seq(1,nrow(reducedChargeData),16),]
+    userColors = userColors[seq(1,nrow(userColors),16)]
+
+    hourColors = rainbow(length(unique(reducedChargeData[,1])))
+    hourColors = hourColors[reducedChargeData[,1]+1]
+    stationColors = rainbow(length(unique(reducedChargeData[,5])))
+    stationColors = stationColors[reducedChargeData[,5]]
+    
+    colnames(reducedChargeData) = c("HourOfDay",
+                                    "Duration",
+                                    "Energy",
+                                    "Distance",
+                                    "Station",
+                                    "User")
+
+    ## Now let's do a t-SNE embedding
+    if (TRUE) {
+        tsneData = Rtsne(reducedChargeData,
+                         dims=2,
+                         perplexity=50,
+                         verbose=TRUE,
+                         max_iter = 1000)
+        plot(tsneData$Y,t='n',
+             main="chargeData t-SNE Embedding (Color By Station, 6 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(tsneData$Y,
+             labels='.',
+             cex=5,
+             col = stationColors)
+        
+        plot(tsneData$Y,t='n',
+             main="chargeData t-SNE Embedding (Color By Hour, 6 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(tsneData$Y,
+             labels='.',
+             cex=5,
+             col = hourColors);
+
+        plot(tsneData$Y,t='n',
+             main="chargeData t-SNE Embedding (Color By HeavyHitters, 6 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(tsneData$Y,
+             labels='.',
+             cex=5,
+             col = userColors);
+        
+        
+        }
+    
+    ## And a UMAP embedding
+    umapConfig = umap.defaults
+    umapConfig$n_neighbors = 50
+    if (TRUE) {
+        umapData = umap(reducedChargeData,config=umapConfig)
+        plot(umapData$layout,
+             t='n',
+             main="chargeData UMAP Embedding (Color By Station, 6 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(umapData$layout,
+             labels='.',
+             cex=5,
+             col = stationColors[reducedChargeData[,5]])
+
+        plot(umapData$layout,
+             t='n',
+             main="chargeData UMAP Embedding (Color By Hour, 6 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(umapData$layout,
+             labels='.',
+             cex=5,
+             col = hourColors[reducedChargeData[,1]])
+    }
+
+    ## Now lets do that without the user and station identifiers. 
+    reducedChargeData = reducedChargeData[,seq(1,4)]
+
+    if (FALSE) {
+        tsneData = Rtsne(reducedChargeData,
+                         dims=2,
+                         perplexity=50,
+                         verbose=TRUE,
+                         max_iter = 1000)
+        plot(tsneData$Y,t='n',
+             main="chargeData t-SNE Embedding (Color By Hour, 4 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(tsneData$Y,
+             labels='.',
+             cex=5,
+             col = hourColors[reducedChargeData[,1]+1])
+
+        plot(tsneData$Y,t='n',
+             main="chargeData t-SNE Embedding (Color By HeavyHitters, 4 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(tsneData$Y,
+             labels='.',
+             cex=5,
+             col = userColors);
+    }
+
+    ## And a UMAP embedding
+    if (TRUE) {
+        umapData = umap(reducedChargeData,config=umapConfig)
+        plot(umapData$layout,
+             t='n',
+             main="chargeData UMAP Embedding (Color By Station, 4 Dimension)",
+             xlabel="X",
+             ylabel="Y")
+        text(umapData$layout,
+             labels='.',
+             cex=5,
+             col = hourColors[reducedChargeData[,1]])
+    }
+}
+

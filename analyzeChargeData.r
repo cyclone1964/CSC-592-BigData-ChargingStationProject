@@ -125,7 +125,8 @@ cleanData <- function(chargeData) {
 
     ## Now get rid of the ones that have NA in them
     chargeData = chargeData[!is.na(chargeData$Distance),]
-
+    print(paste("Removing bad distances leaves",nrow(chargeData), " records"))
+    
     ## Now let's enumerate the station and the users
     numVertices = 1
     vertices = matrix(nrow =nrow(chargeData), ncol=1)
@@ -736,6 +737,14 @@ if (!exists('chargeGraph')) {
     matplot(t(as.matrix(monthlyClosenessCentrality)),t='l',
             xlab='Month Into Data',ylab='Centrality',
             main='Closeness Centrality of All Stations')
+    rm("allCloseness")
+    rm("periodDates")
+    rm("temp")
+    rm("monthEdgeCount")
+    rm("monthEdgeList")
+    rm("uniqueMonthEdgeList")
+    rm("monthCloseness")
+    rm("montlyClosenessCentrality")
 }
 
 if (!exists('stationUserCount')) {
@@ -803,13 +812,21 @@ if (!exists("reducedChargeData")) {
                               chargeData$Duration,
                               chargeData$Energy..kWh,
                               chargeData$Distance,
-                              chargeData$Station.Vertex,
-                              chargeData$User.Vertex)
+                              chargeData$User.Latitude,
+                              chargeData$User.Longitude,
+                              chargeData$Station.Latitude,
+                              chargeData$Station.Longitude)
 
     ## Most of the coloring options we implement can be done directly
     ## from the reduced data set, but the coloring by heavy hitter
     ## user id has to be done in the chargeData data space in order to
     ## use the list of userCounts
+    colors = rainbow(length(unique(chargeData$Station.Vertex)))
+    stationColors = colors[chargeData$Station.Vertex]
+
+    colors = rainbow(length(unique(reducedChargeData[,1])))
+    hourColors = colors[reducedChargeData[,1]+1]
+
     colors = rainbow(length(userCounts)+1)
     userColors=matrix(0,nrow=nrow(chargeData),ncol=1)
     index = 1
@@ -822,20 +839,10 @@ if (!exists("reducedChargeData")) {
 
     ## Now reduce the data by a factor of 16 and set up the colorings
     reducedChargeData = reducedChargeData[seq(1,nrow(reducedChargeData),16),]
-    userColors = userColors[seq(1,nrow(userColors),16)]
-
-    hourColors = rainbow(length(unique(reducedChargeData[,1])))
-    hourColors = hourColors[reducedChargeData[,1]+1]
-    stationColors = rainbow(length(unique(reducedChargeData[,5])))
-    stationColors = stationColors[reducedChargeData[,5]]
+    userColors = userColors[seq(1,length(userColors),16)]
+    hourColors = hourColors[seq(1,length(hourColors),16)]
+    stationColors = stationColors[seq(1,length(stationColors),16)]
     
-    colnames(reducedChargeData) = c("HourOfDay",
-                                    "Duration",
-                                    "Energy",
-                                    "Distance",
-                                    "Station",
-                                    "User")
-
     ## Now let's do a t-SNE embedding
     if (TRUE) {
         tsneData = Rtsne(reducedChargeData,
@@ -844,7 +851,7 @@ if (!exists("reducedChargeData")) {
                          verbose=TRUE,
                          max_iter = 1000)
         plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By Station, 6 Dimension)",
+             main="chargeData t-SNE Embedding (Color By Station)",
              xlabel="X",
              ylabel="Y")
         text(tsneData$Y,
@@ -853,7 +860,7 @@ if (!exists("reducedChargeData")) {
              col = stationColors)
         
         plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By Hour, 6 Dimension)",
+             main="chargeData t-SNE Embedding (Color By Hour)",
              xlabel="X",
              ylabel="Y")
         text(tsneData$Y,
@@ -862,7 +869,7 @@ if (!exists("reducedChargeData")) {
              col = hourColors);
 
         plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By HeavyHitters, 6 Dimension)",
+             main="chargeData t-SNE Embedding (Color By HeavyHitters)",
              xlabel="X",
              ylabel="Y")
         text(tsneData$Y,
@@ -870,8 +877,8 @@ if (!exists("reducedChargeData")) {
              cex=5,
              col = userColors);
         
-        
-        }
+        rm("tsneData")
+    }
     
     ## And a UMAP embedding
     umapConfig = umap.defaults
@@ -880,65 +887,34 @@ if (!exists("reducedChargeData")) {
         umapData = umap(reducedChargeData,config=umapConfig)
         plot(umapData$layout,
              t='n',
-             main="chargeData UMAP Embedding (Color By Station, 6 Dimension)",
+             main="chargeData UMAP Embedding (Color By Station)",
              xlabel="X",
              ylabel="Y")
         text(umapData$layout,
              labels='.',
              cex=5,
-             col = stationColors[reducedChargeData[,5]])
+             col = stationColors)
 
         plot(umapData$layout,
              t='n',
-             main="chargeData UMAP Embedding (Color By Hour, 6 Dimension)",
+             main="chargeData UMAP Embedding (Color By Hour)",
              xlabel="X",
              ylabel="Y")
         text(umapData$layout,
              labels='.',
              cex=5,
-             col = hourColors[reducedChargeData[,1]])
-    }
+             col = hourColors)
 
-    ## Now lets do that without the user and station identifiers. 
-    reducedChargeData = reducedChargeData[,seq(1,4)]
-
-    if (FALSE) {
-        tsneData = Rtsne(reducedChargeData,
-                         dims=2,
-                         perplexity=50,
-                         verbose=TRUE,
-                         max_iter = 1000)
-        plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By Hour, 4 Dimension)",
+        plot(umapData$layout,
+             t='n',
+             main="chargeData UMAP Embedding (Color By HeavyHitters)",
              xlabel="X",
              ylabel="Y")
-        text(tsneData$Y,
-             labels='.',
-             cex=5,
-             col = hourColors[reducedChargeData[,1]+1])
-
-        plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By HeavyHitters, 4 Dimension)",
-             xlabel="X",
-             ylabel="Y")
-        text(tsneData$Y,
+        text(umapData$layout,
              labels='.',
              cex=5,
              col = userColors);
-    }
-
-    ## And a UMAP embedding
-    if (TRUE) {
-        umapData = umap(reducedChargeData,config=umapConfig)
-        plot(umapData$layout,
-             t='n',
-             main="chargeData UMAP Embedding (Color By Station, 4 Dimension)",
-             xlabel="X",
-             ylabel="Y")
-        text(umapData$layout,
-             labels='.',
-             cex=5,
-             col = hourColors[reducedChargeData[,1]])
+        rm("umapData")
     }
 }
 

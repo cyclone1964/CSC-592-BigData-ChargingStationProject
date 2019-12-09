@@ -1,11 +1,31 @@
-## This is a simple script to try to analyze the data in the charging
-## database. These are the libraries we need.
+## This is script is written to generate data for the paper titled
+## "Rhode Island EV Vehicle Charging Data: Trends and Analysis" for
+## CSC 592 - Algoritms for Big Data. The efforts for this paper are:
+##
+## Application of Misra-Gries to identify stations and users
+##
+## Application of Community identification to identify groups of users
+## and their movement around
+##
+## Development of event-based station loading detector algoirthm
+## called "Quick Hitters"
+##
+## Application of tSNE and UMAP dimension reduction to visualize the
+## data looking for patterns in usage.
+
+## lubridate used to massage the date fields of the input data
 library('lubridate')
+
+## Gridding used for making tables
 library('gridExtra')
 library('grid')
 library('igraph')
+
+## Zipcode and goesphere used to compute "Distance From Home"
 library('zipcode')
 library('geosphere')
+
+## Tsne and UMAP libraries
 library('Rtsne')
 library('umap')
 
@@ -15,14 +35,19 @@ data(zipcode)
 ##
 ## This function cleans the input data by doing the following
 ##
-## Removing entries with bad data in them
-## Adding a Start.Time and End.Time field 
+## Removing entries with bad dates, durations, UserIDs, or ZipCodes
+## Adding a Start.Time and End.Time field that are PosixLT types
 ## Sorts entries by Start.Time
+## Remove entries with durations less than 5 minutes or longer than a week
+## Remove entries with User ZipCodes not in MA, RI, or CT
+## Compute the DistanceFromHome and append it
+## Enumerate the stations and users so that we can build graphs
 ##
 ## Arguments
 ## chargeData - the input chargeData frame
 ##
 ## returns
+## cleanData - cleaned data with augmented columns
 ##
 ## chargeData - the cleaned data
 cleanData <- function(chargeData) {
@@ -76,8 +101,8 @@ cleanData <- function(chargeData) {
 
     ## Now, let's convert all the zip codes to only 5 digits
     ## by removing anything after a -
-    chargeData$Driver.Postal.Code = sub("-.*","",
-                                        chargeData$Driver.Postal.Code)
+    chargeData$Driver.Postal.Code =
+        sub("-.*","",chargeData$Driver.Postal.Code)
 
     ## Now let's convert the zip codes to actual numbers and get rid
     ## of ones that fail
@@ -160,7 +185,6 @@ cleanData <- function(chargeData) {
 ## Returns:
 ##
 ## heavyHitters - a named list, with each named entry the count for the entry.
-##
 heavyHitters <- function(hitterList,hitterLimit,numReturn = -1) {
     
     ## The killer here is that R does not natively support a
@@ -244,9 +268,9 @@ countElementNames <-  function(elementNames,numReturn = -1) {
 }
 ##computeLoading - compute the loading for stations in a single pass
 ##
-## This function returns the loading for the stations in the
-## chargeData data frame in a streaming fashion, which is assumed to
-## have the following fields:
+## This function returns the loading and a session count for the
+## stations in the chargeData data frame in a streaming fashion, which
+## is assumed to have the following fields:
 ##
 ## Station.Name - the unique name of each station
 ## Start.Time - the start time of each session
@@ -256,13 +280,24 @@ countElementNames <-  function(elementNames,numReturn = -1) {
 ## chargeData - a data frame of charging data augmented as necessary
 ##
 ## Returns
-## loading - a named list of loading for each station
+## list$Loading - a named list of loading for each station
+## list$Sessions - a named list of session counts for each station
 computeLoading <- function(chargeData)
 {
+
+    ## Initialize the lists
     loading = c()
     sessions = c()
     firstTime = c()
+
+    ## Go through the data frame and accumulate sessions and
+    ## loading. In order to do that, we also need the time of the
+    ## first session, since not all stations were in existence during
+    ## the entire period.
     for (index in seq(1,nrow(chargeData))) {
+
+        ## Add the duration to the loading for this station and
+        ## increment the sessions for it.
         name = as.character(chargeData$Station.Name[index])
         if (length(which(name == names(loading))) == 0) {
             loading[name] = difftime(chargeData$End.Time[index],
@@ -278,6 +313,9 @@ computeLoading <- function(chargeData)
             sessions[name] = sessions[name] + 1
         }
     }
+
+    ## Now normalize the laoding by the entire on time for the
+    ## station.
     for (name in names(loading)) {
         totalTime = difftime(chargeData$End.Time[nrow(chargeData)],
                              chargeData$Start.Time[firstTime[name]],
@@ -285,8 +323,12 @@ computeLoading <- function(chargeData)
         loading[name] = loading[name]/as.numeric(totalTime)
         sessions[name] = sessions[name]/(as.numeric(totalTime)/24)
     }
+
+    ## Now sort the laoding and sessions
     loading = loading[order(unlist(loading),decreasing=TRUE)]
     sessions = sessions[order(unlist(sessions),decreasing=TRUE)]
+
+    ## Now make a named list with those things in it.
     temp = c()
     temp$Loading = loading
     temp$Sessions = sessions
@@ -295,8 +337,8 @@ computeLoading <- function(chargeData)
 ## quickHitters - look for quick hitters
 ##
 ## this funtion finds "quick hitters" in the sense that it counts the
-## number sessions that follow within a few moments of another
-## session., in this case an hour by default.
+## number sessions that follow within a specified period of time of
+## another session., in this case an hour by default.
 ##
 ## Arguments:
 ## chargeData - the chargeData DataFrame
@@ -337,8 +379,9 @@ quickHitters <- function(chargeData, period = 1) {
 }
 ##buildEdgeList - build a list of edges
 ##
-## This function builds a list of edges and returns them along with some
-## bookkeeping information
+## This function builds a list of edges and returns them along with
+## some bookkeeping information. It is used to feed into the
+## findCommunities function.
 ##
 ## Arguments:
 ## chargeData - the input data frame
@@ -358,6 +401,7 @@ buildEdgeList <- function(chargeData) {
     vertexNames = c()
     vertexNumbers = c()
 
+    ## Set up the vertices
     for (stationName in unique(chargeData$Station.Name)) {
         numVertices = numVertices + 1
         vertexNumbers[stationName] = numVertices
@@ -370,12 +414,16 @@ buildEdgeList <- function(chargeData) {
       vertexNames[numVertices] = userId
     }
     numUsers = numVertices - numStations
+
+    ## Now build the edge list as a matrix
     edgeList = matrix(0,nrow = nrow(chargeData), ncol = 2)
     for (index in 1:nrow(chargeData)) {
         edgeList[index,1] = vertexNumbers[chargeData$User.ID[index]]
         edgeList[index,2] = vertexNumbers[chargeData$Station.Name[index]]
     }
     print(paste("Found ",numUsers," users and ", numStations," Stations"))
+
+    ## Load up the output data
     temp = c()
     temp$Edge.List = edgeList
     temp$Vertex.Names = vertexNames
@@ -464,14 +512,15 @@ makeCommunities <- function(edgeList, vMax, numVertices) {
 
     return(communities)
 }
-## Now to support the PCA analysis, we have to create a matrix for the data elements for which that makes sense. Specifically: start hour of the day, duration, distance from home, total energy, 
 
 ## Now, the actual program: first, read the charge data if necessary
 if (!exists("chargeData")) {
 
-    ## Read the data
+    ## Read the data ...
     chargeData = read.csv("RI-ChargingData-2019-10-10.csv",
                           stringsAsFactors=FALSE)
+
+    ## ... and clean it
     chargeData = cleanData(chargeData)
 }
 
@@ -479,7 +528,7 @@ if (!exists("chargeData")) {
 if (!exists("stationHitters")) {
     
     ## Now invoke the heavy hitters algorithm. We ask for the top 10
-    ## then whittle it down to the top 10 for analysis. 
+    ## Also get the ground truth top 10
     print("Run Misra-Gries looking for only the top 10 stations")
     stationHitters = heavyHitters(chargeData$Station.Name, 10, 10)
     stationCount = countElementNames(chargeData$Station.Name, 10)
@@ -503,7 +552,8 @@ if (!exists("stationHitters")) {
     plot.new()
     grid.table(tableData)
 
-    ## Now do it for the hitters with k=50
+    ## Now do it for the hitters with k=50, but only return the top 10
+    ## and build another table.
     stationHitters = heavyHitters(chargeData$Station.Name, 50, 10)
     allNames = unique(c(names(stationHitters),names(stationCount)))
     print('Station: M-G naive');
@@ -573,6 +623,7 @@ if (!exists("userHitters")) {
     plot.new()
     grid.table(tableData)
 }
+
 ## Now let's compute the business of the stations, specifically the
 ## average number of session per day and the loading (percentage of
 ## time) it is used
@@ -600,6 +651,8 @@ if (!exists("sessionsPerDay")) {
     grid.table(tableData)
     print(" Notice that some of these are really REALLY high")
 
+
+    ## Now plot the sessions per day sorted by business
     plot(sessionsPerDay,
          type='o',
          ylab = 'Sessions Per Day', 
@@ -651,6 +704,7 @@ if (!exists("edgeList")) {
                          edgeList[,2] == uniqueEdgeList[index,2]))
     }
 
+    ## Now let's do the community thing for different settings of vMax
     vmaxList = c(10,25,50,100,250,500,1000,2500,5000,10000,20000,40000, 80000)
     tableData = matrix(0,nrow = length(vmaxList),ncol=2,byrow=TRUE)
 
@@ -747,6 +801,9 @@ if (!exists('chargeGraph')) {
     rm("montlyClosenessCentrality")
 }
 
+## Let's go through and count the number of unique users for each
+## station and plot a histogram to see how much cross-pollination
+## there is.
 if (!exists('stationUserCount')) {
 
     ## Let's go through and count the number of unique users for each station
@@ -781,6 +838,7 @@ if (!exists("userStationCount")) {
             names.arg = seq(1,30),
             main='User Station Set Size')
 }
+
 ## Now let's see if we can identify times when charging stations are
 ## used in quick succession. We can use this as an indication that a
 ## specific station is could stand to be upgraded to more slots.
@@ -804,7 +862,8 @@ if (!exists("quickHits")) {
     grid.table(tableData)
 }
 
-## Now, lets do a simple PCA on a reduced data set.
+## Now, lets do tSNE and UMAP reductions on the data, specifically the
+## 7 columns below.
 if (!exists("reducedChargeData")) {
 
     ## First, t-SNE and UMAP embeddings on a 6 dimension set

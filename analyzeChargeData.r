@@ -811,7 +811,6 @@ if (!exists("reducedChargeData")) {
     reducedChargeData = cbind(round(hour(chargeData$Start.Time)),
                               chargeData$Duration,
                               chargeData$Energy..kWh,
-                              chargeData$Distance,
                               chargeData$User.Latitude,
                               chargeData$User.Longitude,
                               chargeData$Station.Latitude,
@@ -851,33 +850,26 @@ if (!exists("reducedChargeData")) {
                          verbose=TRUE,
                          max_iter = 1000)
         plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By Station)",
-             xlabel="X",
-             ylabel="Y")
+             main="chargeData t-SNE Embedding (Color By Station)")
         text(tsneData$Y,
              labels='.',
              cex=5,
              col = stationColors)
         
         plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By Hour)",
-             xlabel="X",
-             ylabel="Y")
+             main="chargeData t-SNE Embedding (Color By Hour)")
         text(tsneData$Y,
              labels='.',
              cex=5,
              col = hourColors);
 
         plot(tsneData$Y,t='n',
-             main="chargeData t-SNE Embedding (Color By HeavyHitters)",
-             xlabel="X",
-             ylabel="Y")
+             main="chargeData t-SNE Embedding (Color By HeavyHitters)")
         text(tsneData$Y,
              labels='.',
              cex=5,
              col = userColors);
         
-        rm("tsneData")
     }
     
     ## And a UMAP embedding
@@ -887,9 +879,7 @@ if (!exists("reducedChargeData")) {
         umapData = umap(reducedChargeData,config=umapConfig)
         plot(umapData$layout,
              t='n',
-             main="chargeData UMAP Embedding (Color By Station)",
-             xlabel="X",
-             ylabel="Y")
+             main="chargeData UMAP Embedding (Color By Station)")
         text(umapData$layout,
              labels='.',
              cex=5,
@@ -897,9 +887,7 @@ if (!exists("reducedChargeData")) {
 
         plot(umapData$layout,
              t='n',
-             main="chargeData UMAP Embedding (Color By Hour)",
-             xlabel="X",
-             ylabel="Y")
+             main="chargeData UMAP Embedding (Color By Hour)")
         text(umapData$layout,
              labels='.',
              cex=5,
@@ -907,9 +895,7 @@ if (!exists("reducedChargeData")) {
 
         plot(umapData$layout,
              t='n',
-             main="chargeData UMAP Embedding (Color By HeavyHitters)",
-             xlabel="X",
-             ylabel="Y")
+             main="chargeData UMAP Embedding (Color By HeavyHitters)")
         text(umapData$layout,
              labels='.',
              cex=5,
@@ -918,3 +904,86 @@ if (!exists("reducedChargeData")) {
     }
 }
 
+## now, let's attempt to cluster the tSNE data. The visualizations
+## above seem to generate specific contiguous sets of data that have
+## structure to them. By trying to figure out which entries are in
+## each one, we can hopefully learn something about the data set.
+if (!exists('tsneClusters')) {
+
+    ## The clustering is this: pick a point and add nearby unclustered
+    ## points to it until we can't anymore. THen go to the next point
+    ## in the cluster and do it again until we can't find any that are
+    ## close enough. Then start a new cluster
+    tolerance = 1.4
+    tsneClusters = list()
+
+    ## For plotting: assume no more than 16 clusters
+    numColors = 16
+    clusterColors=rainbow(numColors)
+    
+    ## This holds the indices for the entries in the current cluster
+    clusterIndices = c(1)
+
+    ## This holds the index in the above list of indices in the
+    ## cluster that we are currently using
+    currentIndex = 1
+
+    ## And these are the indices remaining to be clustered
+    remainingIndices = seq(2,nrow(tsneData$Y))
+    
+    ## Now, let's plot the TSNE thing
+    plot(tsneData$Y,t='n',
+         main="chargeData t-SNE Embedding")
+    text(tsneData$Y,
+         labels='.',
+         cex=1,
+         col = "#000000")
+
+    ## now, while there are remaining indices, make clusters
+    while(length(remainingIndices) > 0) {
+
+        ## now compute the offsets to the remaining entries
+        offsets = cbind(tsneData$Y[remainingIndices,1] -
+                        tsneData$Y[clusterIndices[currentIndex],1],
+                        tsneData$Y[remainingIndices,2] -
+                        tsneData$Y[clusterIndices[currentIndex],2])
+
+        ## And the (squared) distances
+        distances = rowSums(offsets * offsets)
+        
+        ## Now find which of the remaining indices are close enough to
+        ## be joined with the current cluster member.
+        newIndices = which(distances < tolerance * tolerance)
+
+        ## Limit the total size of the new cluster
+        if (length(newIndices) + length(clusterIndices) > 256) {
+            newIndices = newIndices[seq(1,256-length(clusterIndices))]
+        }
+
+        if (length(newIndices) == 0 & 
+            currentIndex >= length(clusterIndices)) {
+
+          if (length(clusterIndices) > 64) {
+            text(tsneData$Y[clusterIndices,],
+                 labels='o',
+                 cex=1,
+                 col =  clusterColors[(length(tsneClusters)%%numColors)+1])
+            print(paste("Cluster ",length(tsneClusters),
+                        " with ",length(clusterIndices)," Entries"))
+            tsneClusters = append(tsneClusters,list(clusterIndices))
+          } else {
+            print(paste("Ingore Cluster with ",
+                        length(clusterIndices)," Entries"))
+          }
+            clusterIndices = c(remainingIndices[1])
+            remainingIndices = remainingIndices[-1]
+            currentIndex = 1
+        } else {
+            if (length(newIndices)> 1){
+                clusterIndices = c(clusterIndices,remainingIndices[newIndices])
+                remainingIndices = remainingIndices[-newIndices]
+            }
+            currentIndex = currentIndex + 1
+        }
+    }
+}

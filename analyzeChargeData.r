@@ -58,6 +58,7 @@ cleanData <- function(chargeData) {
                         chargeData$User.ID != "0" & 
                         chargeData$End.Date != "" & 
                         chargeData$Start.Date != "" &
+                        chargeData$Start.Time.Zone != "UTC" & 
                         chargeData$Total.Duration..hh.mm.ss. != "")
     chargeData = chargeData[goodIndices,]
     print(paste("Editing for bad User ID, start and end dates,",
@@ -85,6 +86,11 @@ cleanData <- function(chargeData) {
     duration = hms(chargeData$Total.Duration)
     duration = as.numeric(duration)/3600
 
+    ## Now find those that are EDT and move them back an hour
+    indices = which(chargeData$Start.Time.Zone == "EDT")
+    startTime[indices] =startTime[indices] - 60
+    endTime[indices] = endTime[indices]-60
+    
     ## Add times to the data frame
     chargeData$Start.Time = startTime
     chargeData$End.Time = endTime
